@@ -1,15 +1,18 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 const cookieParser = require("cookie-parser");
+const bcrypt = require("bcrypt");
 const { DEFAULT_DB_FILE, openDatabase } = require("../db");
 
 function sendPublicFile(response, fileName) {
   response.sendFile(path.join(__dirname, "..", "public", fileName));
 }
 
+// FIX #5: Cryptographically secure session ID
 function createSessionId() {
-  return `SESSION-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+  return crypto.randomBytes(32).toString("hex");
 }
 
 async function createApp() {
@@ -28,6 +31,7 @@ async function createApp() {
   app.use("/css", express.static(path.join(__dirname, "..", "public", "css")));
   app.use("/js", express.static(path.join(__dirname, "..", "public", "js")));
 
+  // Session middleware — unchanged logic, already used parameterized query
   app.use(async (request, response, next) => {
     const sessionId = request.cookies.sid;
 
@@ -70,7 +74,15 @@ async function createApp() {
       response.status(401).json({ error: "Authentication required." });
       return;
     }
+    next();
+  }
 
+  // FIX #3: Role-based guard for admin routes
+  function requireAdmin(request, response, next) {
+    if (!request.currentUser || request.currentUser.role !== "admin") {
+      response.status(403).json({ error: "Forbidden." });
+      return;
+    }
     next();
   }
 
@@ -84,32 +96,45 @@ async function createApp() {
     response.json({ user: request.currentUser });
   });
 
+  // FIX #1: Parameterized query (no SQL injection)
+  // FIX #4: bcrypt password comparison (no plaintext passwords)
   app.post("/api/login", async (request, response) => {
     const username = String(request.body.username || "");
     const password = String(request.body.password || "");
 
-    const query = `
-      SELECT id, username, role, display_name
-      FROM users
-      WHERE username = '${username}' AND password = '${password}'
-    `;
-    const user = await db.get(query);
+    const user = await db.get(
+      "SELECT id, username, role, display_name, password AS passwordHash FROM users WHERE username = ?",
+      [username]
+    );
 
-    if (!user) {
+    // NOTE: This assumes passwords are stored as bcrypt hashes.
+    // When creating users, hash passwords with: bcrypt.hash(plainPassword, 12)
+    const passwordValid = user && await bcrypt.compare(password, user.passwordHash);
+
+    if (!passwordValid) {
       response.status(401).json({ error: "Invalid username or password." });
       return;
     }
 
-    const sessionId = request.cookies.sid || createSessionId();
+    // FIX #5: Use new secure session ID, never reuse attacker-supplied cookie value
+    const sessionId = createSessionId();
 
-    await db.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
+    // Clean up any existing sessions for this user (optional: enforce single session)
+    if (request.cookies.sid) {
+      await db.run("DELETE FROM sessions WHERE id = ?", [request.cookies.sid]);
+    }
+
     await db.run(
       "INSERT INTO sessions (id, user_id, created_at) VALUES (?, ?, ?)",
       [sessionId, user.id, new Date().toISOString()]
     );
 
+    // FIX #6: Secure cookie flags
     response.cookie("sid", sessionId, {
-      path: "/"
+      path: "/",
+      httpOnly: true,   // Not accessible to JavaScript — mitigates XSS theft
+      secure: true,     // Only sent over HTTPS
+      sameSite: "strict" // Mitigates CSRF
     });
 
     response.json({
@@ -132,31 +157,58 @@ async function createApp() {
     response.json({ ok: true });
   });
 
+  // FIX #1: Parameterized query (no SQL injection)
+  // FIX #2: Enforce ownership — users can only query their own notes unless admin
   app.get("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = request.query.ownerId || request.currentUser.id;
+    const isAdmin = request.currentUser.role === "admin";
+    const requestedOwnerId = request.query.ownerId
+      ? Number(request.query.ownerId)
+      : request.currentUser.id;
+
+    // Non-admins can only access their own notes
+    if (!isAdmin && requestedOwnerId !== request.currentUser.id) {
+      response.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const ownerId = requestedOwnerId;
     const search = request.query.search || "";
 
-    const notes = await db.all(`
-      SELECT
-        notes.id,
-        notes.owner_id AS ownerId,
-        users.username AS ownerUsername,
-        notes.title,
-        notes.body,
-        notes.pinned,
-        notes.created_at AS createdAt
-      FROM notes
-      JOIN users ON users.id = notes.owner_id
-      WHERE notes.owner_id = ${ownerId}
-        AND (notes.title LIKE '%${search}%' OR notes.body LIKE '%${search}%')
-      ORDER BY notes.pinned DESC, notes.id DESC
-    `);
+    const notes = await db.all(
+      `
+        SELECT
+          notes.id,
+          notes.owner_id AS ownerId,
+          users.username AS ownerUsername,
+          notes.title,
+          notes.body,
+          notes.pinned,
+          notes.created_at AS createdAt
+        FROM notes
+        JOIN users ON users.id = notes.owner_id
+        WHERE notes.owner_id = ?
+          AND (notes.title LIKE ? OR notes.body LIKE ?)
+        ORDER BY notes.pinned DESC, notes.id DESC
+      `,
+      [ownerId, `%${search}%`, `%${search}%`]
+    );
 
     response.json({ notes });
   });
 
+  // FIX #2: Enforce ownership — users can only create notes for themselves unless admin
   app.post("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = Number(request.body.ownerId || request.currentUser.id);
+    const isAdmin = request.currentUser.role === "admin";
+    const requestedOwnerId = request.body.ownerId
+      ? Number(request.body.ownerId)
+      : request.currentUser.id;
+
+    if (!isAdmin && requestedOwnerId !== request.currentUser.id) {
+      response.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const ownerId = requestedOwnerId;
     const title = String(request.body.title || "");
     const body = String(request.body.body || "");
     const pinned = request.body.pinned ? 1 : 0;
@@ -172,8 +224,19 @@ async function createApp() {
     });
   });
 
+  // FIX #2: Enforce ownership — users can only read their own settings unless admin
   app.get("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.query.userId || request.currentUser.id);
+    const isAdmin = request.currentUser.role === "admin";
+    const requestedUserId = request.query.userId
+      ? Number(request.query.userId)
+      : request.currentUser.id;
+
+    if (!isAdmin && requestedUserId !== request.currentUser.id) {
+      response.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const userId = requestedUserId;
 
     const settings = await db.get(
       `
@@ -195,8 +258,19 @@ async function createApp() {
     response.json({ settings });
   });
 
+  // FIX #2: Enforce ownership — users can only update their own settings unless admin
   app.post("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.body.userId || request.currentUser.id);
+    const isAdmin = request.currentUser.role === "admin";
+    const requestedUserId = request.body.userId
+      ? Number(request.body.userId)
+      : request.currentUser.id;
+
+    if (!isAdmin && requestedUserId !== request.currentUser.id) {
+      response.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const userId = requestedUserId;
     const displayName = String(request.body.displayName || "");
     const statusMessage = String(request.body.statusMessage || "");
     const theme = String(request.body.theme || "classic");
@@ -211,6 +285,7 @@ async function createApp() {
     response.json({ ok: true });
   });
 
+  // No ownership issue here — already uses session user ID only
   app.get("/api/settings/toggle-email", requireAuth, async (request, response) => {
     const enabled = request.query.enabled === "1" ? 1 : 0;
 
@@ -226,7 +301,8 @@ async function createApp() {
     });
   });
 
-  app.get("/api/admin/users", requireAuth, async (_request, response) => {
+  // FIX #3: requireAdmin instead of just requireAuth
+  app.get("/api/admin/users", requireAuth, requireAdmin, async (_request, response) => {
     const users = await db.all(`
       SELECT
         users.id,
